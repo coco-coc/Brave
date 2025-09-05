@@ -1,0 +1,732 @@
+name: Auto Sync Fork with Releases
+
+on:
+  schedule:
+    - cron: '0 17 * * *'  # 每天 UTC 17 点自动运行
+  workflow_dispatch:      # 允许手动触发
+    inputs:
+      release_age_days:
+        description: '只同步最近多少天内的Release (默认3天)'
+        required: false
+        default: '3'
+
+permissions:
+  contents: write
+  actions: read
+
+# 添加并发控制，防止多个工作流同时运行
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync-fork:
+    runs-on: ubuntu-latest
+    steps:
+      # 1️⃣ 初始磁盘空间检查
+      - name: Check initial disk space
+        run: |
+          echo "初始磁盘空间使用情况:"
+          df -h
+          echo "当前目录: $(pwd)"
+          echo "工作空间内容:"
+          ls -la
+
+      # 2️⃣ 检出你的 fork 仓库
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.SYNC_PAT }}
+          persist-credentials: true
+          fetch-depth: 0
+
+      # 3️⃣ 安装必要工具
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+          # 安装 GitHub CLI
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y gh
+
+      # 4️⃣ 配置 Git
+      - name: Configure git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          # 配置认证使用 PAT
+          git config --global credential.helper store
+          echo "https://${{ github.actor }}:${{ secrets.SYNC_PAT }}@github.com" > ~/.git-credentials
+
+      # 5️⃣ 清理磁盘空间
+      - name: Clean up disk space
+        run: |
+          echo "清理磁盘空间..."
+          # 清理包管理器缓存
+          sudo apt-get clean || true
+          # 删除未使用的包
+          sudo apt-get autoremolve -y || true
+          # 清理临时文件
+          sudo rm -rf /tmp/* || true
+          sudo rm -rf /var/tmp/* || true
+          # 清理日志文件
+          sudo find /var/log -name "*.log" -type f -mtime +0 -delete 2>/dev/null || true
+          sudo find /var.log -name "*.gz" -type f -delete 2>/dev/null || true
+          
+          echo "清理后磁盘空间使用情况:"
+          df -h
+
+      # 6️⃣ 获取默认分支
+      - name: Get default branch
+        id: get_default_branch
+        run: |
+          default_branch=$(git remote show origin | grep 'HEAD branch' | awk '{print $NF}')
+          echo "Default branch: $default_branch"
+          echo "default_branch=$default_branch" >> $GITHUB_OUTPUT
+          echo "DEFAULT_BRANCH=$default_branch" >> $GITHUB_ENV
+
+      # 7️⃣ 备份工作流文件
+      - name: Backup workflow files
+        run: |
+          mkdir -p /tmp/backup
+          # 只备份同步工作流本身
+          if [ -f ".github/workflows/sync.yml" ]; then
+            cp .github/workflows/sync.yml /tmp/backup/
+            echo "Backed up sync workflow"
+          else
+            echo "No sync workflow found to backup"
+          fi
+
+      # 8️⃣ 删除所有可能导致问题的工作流文件
+      - name: Remove problematic workflow files
+        run: |
+          # 删除所有可能触发构建的工作流文件
+          rm -f .github/workflows/build.yml 2>/dev/null || true
+          rm -f .github/workflows/android.yml 2>/dev/null || true
+          rm -f .github/workflows/ci.yml 2>/dev/null || true
+          rm -f .github/workflows/release.yml 2>/dev/null || true
+          echo "Removed problematic workflow files"
+          
+          # 删除 Android 签名配置文件
+          rm -f android/key.properties 2>/dev/null || true
+          rm -f android/app/android_keystore.jks 2>/dev/null || true
+          # 删除可能引用这些文件的 Gradle 配置
+          sed -i '/android_keystore/d' android/app/build.gradle 2>/dev/null || true
+          echo "Removed Android config files"
+
+      # 9️⃣ 添加上游仓库并获取所有内容
+      - name: Add upstream and fetch
+        run: |
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/brave/brave-browser.git
+          git fetch upstream --tags --force --prune
+          git fetch upstream --force --prune '+refs/heads/*:refs/remotes/upstream/*'
+
+      # 🔟 同步所有分支（保留工作流文件）
+      - name: Sync branches with workflow preservation
+        run: |
+          # 使用之前获取的默认分支
+          default_branch=${{ steps.get_default_branch.outputs.default_branch }}
+          echo "Default branch: $default_branch"
+          
+          # 获取上游所有分支
+          git show-ref | grep 'refs/remotes/upstream/' | while read hash ref; do
+            branch_name=${ref#refs/remotes/upstream/}
+            
+            # 跳过 HEAD 引用
+            if [ "$branch_name" = "HEAD" ]; then
+              continue
+            fi
+            
+            echo "Processing branch: $branch_name"
+            
+            # 创建或更新本地分支
+            if git show-ref --verify --quiet refs/heads/$branch_name; then
+              echo "Updating existing branch: $branch_name"
+              git checkout $branch_name
+              
+              # 对于默认分支，使用合并而不是重置，以保留工作流文件
+              if [ "$branch_name" = "$default_branch" ]; then
+                echo "Merging upstream changes to default branch (preserving workflows)"
+                # 关键修改：添加 --allow-unrelated-histories 选项
+                git merge --no-commit --allow-unrelated-histories upstream/$branch_name
+                
+                # 恢复工作流文件
+                if [ -f "/tmp/backup/sync.yml" ]; then
+                  mkdir -p .github/workflows
+                  cp /tmp/backup/sync.yml .github/workflows/
+                  git add .github/workflows/sync.yml
+                fi
+                
+                # 提交合并
+                if ! git diff --cached --quiet; then
+                  git commit -m "Merge upstream changes and preserve workflows"
+                fi
+              else
+                # 对于非默认分支，使用硬重置
+                git reset --hard upstream/$branch_name
+              fi
+            else
+              echo "Creating new branch: $branch_name"
+              git checkout -b $branch_name upstream/$branch_name
+            fi
+            
+            # 推送到 origin - 使用已配置的认证
+            echo "Pushing $branch_name to origin"
+            git push origin $branch_name --force
+          done
+
+      # 1️⃣1️⃣ 同步所有标签
+      - name: Sync all tags
+        run: |
+          # 删除所有本地标签（避免冲突）
+          git tag -l | xargs git tag -d 2>/dev/null || true
+          # 获取上游所有标签
+          git fetch upstream --tags --force
+          # 推送所有标签到origin
+          git push origin --tags --force
+
+      # 1️⃣2️⃣ 创建可调节时间范围的同步脚本
+      - name: Create time-filtered sync script
+        run: |
+          cat > time_filtered_sync.sh << 'EOF'
+          #!/bin/bash
+          
+          # 设置环境变量
+          export GITHUB_TOKEN="${{ secrets.SYNC_PAT }}"
+          export REPO_DIR="$GITHUB_WORKSPACE"
+          export GITHUB_USER="${{ github.repository_owner }}"
+          export REPO_NAME="${{ github.event.repository.name }}"
+          export UPSTREAM_OWNER="brave"
+          export UPSTREAM_REPO="brave-browser"
+          export LOG_FILE="$GITHUB_WORKSPACE/sync.log"
+          export TEMP_DIR="/tmp/time_filtered_sync"
+          export STATE_FILE="$REPO_DIR/.sync_state"
+          export DEFAULT_BRANCH="${{ env.DEFAULT_BRANCH }}"
+          
+          # 设置时间范围参数（默认3天）
+          RELEASE_AGE_DAYS=${RELEASE_AGE_DAYS:-3}
+          echo "$(date '+%Y-%m-%d %H:%M:%S') - 只同步最近 $RELEASE_AGE_DAYS 天内的Release" >> "$LOG_FILE"
+          
+          # 计算截止日期（修复时间计算问题）
+          CUTOFF_DATE=$(date -u -d "-$RELEASE_AGE_DAYS days" +%Y-%m-%dT%H:%M:%SZ)
+          echo "$(date '+%Y-%m-%d %H:%M:%S') - 截止日期: $CUTOFF_DATE" >> "$LOG_FILE"
+          echo "$(date '+%Y-%m-%d %H:%M:%S') - 当前日期: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LOG_FILE"
+          
+          # 创建临时目录
+          mkdir -p "$TEMP_DIR"
+          
+          # 进入仓库目录
+          cd "$REPO_DIR"
+          
+          # 记录日志
+          echo "$(date '+%Y-%m-%d %H:%M:%S') - 开始时间过滤同步发布..." >> "$LOG_FILE"
+          echo "$(date '+%Y-%m-%d %H:%M:%S') - 工作目录: $(pwd)" >> "$LOG_FILE"
+          echo "$(date '+%Y-%m-%d %H:%M:%S') - 磁盘空间情况:" >> "$LOG_FILE"
+          df -h . >> "$LOG_FILE"
+          
+          # 检查API限制的函数
+          check_rate_limit() {
+            local response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/rate_limit)
+            local remaining=$(echo "$response" | jq -r '.resources.core.remaining')
+            local reset=$(echo "$response" | jq -r '.resources.core.reset')
+            
+            if [ -z "$remaining" ] || [ -z "$reset" ]; then
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - 无法获取API限制信息，继续执行..." >> "$LOG_FILE"
+              return 0
+            fi
+            
+            local current_time=$(date +%s)
+            local reset_in=$((reset - current_time))
+            
+            if [ "$remaining" -lt 50 ]; then
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - API限制接近 ($remaining 次请求剩余)" >> "$LOG_FILE"
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - 将在 $reset_in 秒后重置，等待中..." >> "$LOG_FILE"
+              if [ "$reset_in" -gt 0 ]; then
+                sleep $((reset_in + 10))
+              fi
+              return 1
+            fi
+            return 0
+          }
+          
+          # 带重试的API请求函数
+          api_request() {
+            local url=$1
+            local output=$2
+            local retries=5
+            local delay=10
+            
+            for ((i=1; i<=retries; i++)); do
+              check_rate_limit
+              local http_code=$(curl -s -o "$output" -w "%{http_code}" \
+                -H "Authorization: token $GITHUB_TOKEN" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "$url")
+              
+              if ! echo "$http_code" | grep -qE '^[0-9]+$'; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - API请求失败: 无效的HTTP状态码 '$http_code'" >> "$LOG_FILE"
+                sleep $delay
+                continue
+              fi
+              
+              if [ "$http_code" -eq 200 ]; then
+                return 0
+              elif [ "$http_code" -eq 403 ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - API请求被限制 (HTTP $http_code)，等待后重试..." >> "$LOG_FILE"
+                sleep 60
+              elif [ "$http_code" -eq 404 ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - API请求的资源不存在 (HTTP $http_code)" >> "$LOG_FILE"
+                return 1
+              else
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - API请求失败 (HTTP $http_code)，重试 $i/$retries..." >> "$LOG_FILE"
+                sleep $delay
+              fi
+              rm -f "$output"
+            done
+            
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - API请求失败: $url" >> "$LOG_FILE"
+            return 1
+          }
+          
+          # 获取所有Release（处理分页）- 修复版本
+          get_all_releases() {
+            local owner=$1
+            local repo=$2
+            local page=1
+            local all_releases_file="$TEMP_DIR/all_releases.json"
+            
+            # 初始化空数组
+            echo "[]" > "$all_releases_file"
+            
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - 开始获取所有 $owner/$repo 的Release（处理分页）..." >> "$LOG_FILE"
+            
+            while true; do
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - 获取第 $page 页Release..." >> "$LOG_FILE"
+              
+              local url="https://api.github.com/repos/$owner/$repo/releases?page=$page&per_page=100"
+              local output_file="$TEMP_DIR/${owner}_${repo}_releases_page_$page.json"
+              
+              if api_request "$url" "$output_file"; then
+                # 检查是否为空页
+                local page_count=$(jq length "$output_file")
+                if [ "$page_count" -eq 0 ]; then
+                  echo "$(date '+%Y-%m-%d %H:%M:%S') - 第 $page 页为空，停止分页" >> "$LOG_FILE"
+                  break
+                fi
+                
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - 第 $page 页获取成功，共 $page_count 个Release" >> "$LOG_FILE"
+                
+                # 使用临时文件合并JSON数据，避免参数过长
+                jq -s '.[0] + .[1]' "$all_releases_file" "$output_file" > "${all_releases_file}.tmp"
+                mv "${all_releases_file}.tmp" "$all_releases_file"
+                
+                page=$((page + 1))
+                
+                # 添加延迟以避免速率限制
+                sleep 2
+              else
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - 获取第 $page 页Release失败" >> "$LOG_FILE"
+                break
+              fi
+            done
+            
+            local total_count=$(jq length "$all_releases_file")
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - 总共获取 $total_count 个Release" >> "$LOG_FILE"
+            
+            # 过滤出最近指定天数内的Release，并排除草稿发布
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - 过滤最近 $RELEASE_AGE_DAYS 天内的Release（排除草稿）..." >> "$LOG_FILE"
+            jq --arg cutoff "$CUTOFF_DATE" '
+              map(select(.published_at != null and .published_at >= $cutoff and .draft == false))
+            ' "$all_releases_file" > "${all_releases_file}_filtered.json"
+            
+            local filtered_count=$(jq length "${all_releases_file}_filtered.json")
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - 过滤后剩余 $filtered_count 个Release" >> "$LOG_FILE"
+            
+            # 调试：输出前几个发布的日期
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - 前几个发布的日期:" >> "$LOG_FILE"
+            jq -r '.[0:5] | .[] | "\(.tag_name): \(.published_at)"' "${all_releases_file}_filtered.json" >> "$LOG_FILE" 2>/dev/null || true
+            
+            cat "${all_releases_file}_filtered.json"
+          }
+          
+          # 版本号比较函数
+          version_compare() {
+            local a=$1
+            local b=$2
+            
+            # 移除可能的前缀（如"v"）
+            a=${a#v}
+            b=${b#v}
+            
+            # 分割版本号为数组
+            IFS='.' read -ra a_parts <<< "$a"
+            IFS='.' read -ra b_parts <<< "$b"
+            
+            # 比较每个部分
+            for i in "${!a_parts[@]}"; do
+              if [[ -z "${b_parts[i]}" ]]; then
+                echo 1
+                return
+              fi
+              
+              if [[ "${a_parts[i]}" -gt "${b_parts[i]}" ]]; then
+                echo 1
+                return
+              elif [[ "${a_parts[i]}" -lt "${b_parts[i]}" ]]; then
+                echo -1
+                return
+              fi
+            done
+            
+            # 如果a的版本号部分更少，但前面的部分都相等，则a更小
+            if [[ ${#a_parts[@]} -lt ${#b_parts[@]} ]]; then
+              echo -1
+              return
+            fi
+            
+            echo 0
+          }
+          
+          # 按版本号排序函数
+          sort_by_version() {
+            local releases=$1
+            local sorted_file="$TEMP_DIR/sorted_releases.json"
+            
+            echo "$releases" > "$sorted_file"
+            
+            # 使用版本号比较函数进行排序
+            # 由于jq不支持自定义比较函数，我们使用外部排序
+            # 首先提取版本号和整个对象
+            echo "$releases" | jq -c '.[]' | while read -r release; do
+              tag_name=$(echo "$release" | jq -r '.tag_name')
+              echo "$tag_name $release"
+            done | sort -t ' ' -k1,1 -V | cut -d' ' -f2- | jq -s '.' > "$sorted_file"
+            
+            cat "$sorted_file"
+          }
+          
+          # 读取状态文件
+          read_state() {
+            if [ -f "$STATE_FILE" ]; then
+              source "$STATE_FILE"
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - 读取同步状态: 最后同步标签=$LAST_SYNC_TAG, 最后同步时间=$LAST_SYNC_TIME" >> "$LOG_FILE"
+            else
+              # 首次运行，初始化状态
+              LAST_SYNC_TAG=""
+              LAST_SYNC_TIME=""
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - 首次运行，需要同步所有Release" >> "$LOG_FILE"
+            fi
+          }
+          
+          # 写入状态文件
+          write_state() {
+            local tag=$1
+            local time=$2
+            
+            echo "LAST_SYNC_TAG=\"$tag\"" > "$STATE_FILE"
+            echo "LAST_SYNC_TIME=\"$time\"" >> "$STATE_FILE"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - 更新同步状态: 最后同步标签=$tag, 最后同步时间=$time" >> "$LOG_FILE"
+          }
+          
+          # 修复磁盘空间检查函数 - 降低阈值到1GB
+          check_disk_space() {
+            # 获取当前目录的可用空间（以KB为单位）
+            local available_kb=$(df -k . | awk 'NR==2 {print $4}')
+            
+            # 确保available_kb是数字
+            if ! echo "$available_kb" | grep -qE '^[0-9]+$'; then
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - 无法获取磁盘空间信息" >> "$LOG_FILE"
+              return 1
+            fi
+            
+            # 转换为字节
+            local available_bytes=$((available_kb * 1024))
+            
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - 可用磁盘空间: $available_kb KB ($available_bytes 字节)" >> "$LOG_FILE"
+            
+            # 检查是否小于1GB（降低阈值）
+            if [ "$available_bytes" -lt 1000000000 ]; then  # 1GB = 1,000,000,000 字节
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - 磁盘空间不足 (小于1GB)" >> "$LOG_FILE"
+              return 1
+            fi
+            
+            return 0
+          }
+          
+          # 检查本地是否已存在Release
+          check_local_release_exists() {
+            local tag_name=$1
+            local local_releases=$2
+            
+            for j in $(seq 0 $(($(echo "$local_releases" | jq length) - 1))); do
+              local_release=$(echo "$local_releases" | jq -c ".[$j]")
+              local_tag_name=$(echo "$local_release" | jq -r '.tag_name')
+              
+              if [ "$tag_name" = "$local_tag_name" ]; then
+                local_release_id=$(echo "$local_release" | jq -r '.id')
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Release $tag_name 已存在 (ID: $local_release_id)" >> "$LOG_FILE"
+                
+                # 检查是否需要更新资产
+                local_assets=$(echo "$local_release" | jq -r '.assets | length')
+                upstream_assets=$3
+                
+                if [ "$local_assets" -lt "$upstream_assets" ]; then
+                  echo "$(date '+%Y-%m-%d %H:%M:%S') - 本地Release缺少资产 ($local_assets/$upstream_assets)，可能需要更新" >> "$LOG_FILE"
+                  return 1  # 返回1表示需要更新
+                else
+                  echo "$(date '+%Y-%m-%d %H:%M:%S') - 本地Release资产完整，跳过同步" >> "$LOG_FILE"
+                  return 0  # 返回0表示已存在且完整
+                fi
+              fi
+            done
+            
+            return 2  # 返回2表示不存在
+          }
+          
+          # 登录GitHub CLI
+          echo "$(date '+%Y-%m-%d %H:%M:%S') - 登录GitHub CLI..." >> "$LOG_FILE"
+          echo "$GITHUB_TOKEN" | gh auth login --with-token >> "$LOG_FILE" 2>&1
+          
+          # 读取上次同步状态
+          read_state
+          
+          # 检查磁盘空间 - 只在开始时检查一次
+          if ! check_disk_space; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - 磁盘空间不足，停止执行" >> "$LOG_FILE"
+            exit 1
+          fi
+          
+          # 获取上游所有Release
+          echo "$(date '+%Y-%m-%d %H:%M:%S') - 获取上游所有Release..." >> "$LOG_FILE"
+          upstream_releases=$(get_all_releases "$UPSTREAM_OWNER" "$UPSTREAM_REPO")
+          upstream_count=$(echo "$upstream_releases" | jq length)
+          echo "$(date '+%Y-%m-%d %H:%M:%S') - 共获取 $upstream_count 个上游Release（过滤后）" >> "$LOG_FILE"
+          
+          # 获取本地所有Release
+          echo "$(date '+%Y-%m-%d %H:%M:%S') - 获取本地所有Release..." >> "$LOG_FILE"
+          local_releases=$(get_all_releases "$GITHUB_USER" "$REPO_NAME")
+          local_count=$(echo "$local_releases" | jq length)
+          echo "$(date '+%Y-%m-%d %H:%M:%S') - 共获取 $local_count 个本地Release" >> "$LOG_FILE"
+          
+          # 如果没有需要同步的Release，则退出
+          if [ "$upstream_count" -eq 0 ]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - 没有需要同步的Release，退出" >> "$LOG_FILE"
+            exit 0
+          fi
+          
+          # 按版本号排序上游Release
+          echo "$(date '+%Y-%m-%d %H:%M:%S') - 按版本号排序上游Release..." >> "$LOG_FILE"
+          sorted_upstream_releases=$(sort_by_version "$upstream_releases")
+          echo "$sorted_upstream_releases" > "$TEMP_DIR/sorted_upstream_releases.json"
+          
+          # 处理每个Release
+          release_count=0
+          skipped_count=0
+          failed_count=0
+          
+          for i in $(seq 0 $((upstream_count - 1))); do
+            # 使用jq直接从文件读取，避免参数过长
+            release=$(jq -c ".[$i]" "$TEMP_DIR/sorted_upstream_releases.json")
+            tag_name=$(echo "$release" | jq -r '.tag_name')
+            name=$(echo "$release" | jq -r '.name')
+            body=$(echo "$release" | jq -r '.body')
+            draft=$(echo "$release" | jq -r '.draft')
+            prerelease=$(echo "$release" | jq -r '.prerelease')
+            release_id=$(echo "$release" | jq -r '.id')
+            published_at=$(echo "$release" | jq -r '.published_at')
+            html_url=$(echo "$release" | jq -r '.html_url')
+            assets_count=$(echo "$release" | jq -r '.assets | length')
+            
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - 处理Release: $tag_name (发布时间: $published_at)" >> "$LOG_FILE"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Release URL: $html_url" >> "$LOG_FILE"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Draft: $draft, Prerelease: $prerelease, 资产数量: $assets_count" >> "$LOG_FILE"
+            
+            # 检查本地是否已存在此Release
+            check_local_release_exists "$tag_name" "$local_releases" "$assets_count"
+            case $? in
+              0)  # 已存在且完整
+                skipped_count=$((skipped_count + 1))
+                continue
+                ;;
+              1)  # 已存在但不完整，需要更新
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Release $tag_name 已存在但资产不完整，需要更新" >> "$LOG_FILE"
+                ;;
+              2)  # 不存在，需要创建
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Release $tag_name 不存在，需要创建" >> "$LOG_FILE"
+                ;;
+            esac
+            
+            RELEASE_TEMP_DIR="$TEMP_DIR/release_$release_id"
+            mkdir -p "$RELEASE_TEMP_DIR"
+            echo "$release" > "$RELEASE_TEMP_DIR/release_info.json"
+            
+            asset_count=0
+            assets=$(echo "$release" | jq -c '.assets[]' 2>/dev/null || echo "")
+            
+            if [ -n "$assets" ] && [ "$assets_count" -gt 0 ]; then
+              echo "$assets" > "$RELEASE_TEMP_DIR/assets.json"
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - Release $tag_name 有 $assets_count 个资产" >> "$LOG_FILE"
+              
+              # 修复资产下载问题 - 使用正确的循环方式
+              while IFS= read -r asset; do
+                browser_download_url=$(echo "$asset" | jq -r '.browser_download_url')
+                filename=$(echo "$asset" | jq -r '.name')
+                size=$(echo "$asset" | jq -r '.size')
+                size_mb=$((size / 1024 / 1024))
+                
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - 下载文件: $filename (大小: $size_mb MB)" >> "$LOG_FILE"
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - 下载URL: $browser_download_url" >> "$LOG_FILE"
+                
+                # 移除文件大小限制，只检查基本磁盘空间
+                if ! check_disk_space; then
+                  echo "$(date '+%Y-%m-%d %H:%M:%S') - 磁盘空间不足，跳过文件下载" >> "$LOG_FILE"
+                  continue
+                fi
+                
+                retries=5
+                for ((j=1; j<=retries; j++)); do
+                  # 修复文件下载 - 使用正确的curl命令
+                  if curl -L --fail \
+                    -H "Authorization: token $GITHUB_TOKEN" \
+                    -H "Accept: application/octet-stream" \
+                    -o "$RELEASE_TEMP_DIR/$filename" \
+                    "$browser_download_url" >> "$LOG_FILE" 2>&1; then
+                    
+                    # 检查文件是否下载成功
+                    if [ -f "$RELEASE_TEMP_DIR/$filename" ]; then
+                      downloaded_size=$(stat -c%s "$RELEASE_TEMP_DIR/$filename" 2>/dev/null || stat -f%z "$RELEASE_TEMP_DIR/$filename" 2>/dev/null)
+                      # 不再检查文件大小是否匹配，因为大文件可能会有变化
+                      asset_count=$((asset_count + 1))
+                      echo "$(date '+%Y-%m-%d %H:%M:%S') - 文件 $filename 下载成功 ($downloaded_size 字节)" >> "$LOG_FILE"
+                      break
+                    else
+                      echo "$(date '+%Y-%m-%d %H:%M:%S') - 文件下载失败: $filename" >> "$LOG_FILE"
+                    fi
+                  else
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - 下载文件失败，重试 $j/$retries..." >> "$LOG_FILE"
+                    sleep 10
+                  fi
+                done
+              done < "$RELEASE_TEMP_DIR/assets.json"
+              
+              rm -f "$RELEASE_TEMP_DIR/assets.json"
+            else
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - Release $tag_name 没有文件资源" >> "$LOG_FILE"
+            fi
+            
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - 创建Release: $tag_name" >> "$LOG_FILE"
+            
+            # 确保不创建草稿发布，即使上游有草稿（但我们已经过滤掉了）
+            # 只处理预发布和正式发布
+            prerelease_flag=""
+            
+            if [ "$prerelease" = "true" ]; then
+              prerelease_flag="--prerelease"
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - 这是一个预发布版本" >> "$LOG_FILE"
+            else
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - 这是一个正式发布版本" >> "$LOG_FILE"
+            fi
+            
+            # 修复目标提交问题 - 关键修改
+            target_commitish=$(git rev-list -n 1 "$tag_name" 2>/dev/null || echo "")
+            if [ -z "$target_commitish" ]; then
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - 警告: 找不到标签 $tag_name 对应的提交，使用默认分支 $DEFAULT_BRANCH" >> "$LOG_FILE"
+              target_commitish="$DEFAULT_BRANCH"
+            fi
+            
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - 使用目标提交: $target_commitish" >> "$LOG_FILE"
+            
+            release_created=false
+            retries=5
+            
+            for ((j=1; j<=retries; j++)); do
+              if [ "$asset_count" -gt 0 ]; then
+                # 修复文件上传 - 使用正确的gh release命令
+                if gh release create "$tag_name" \
+                  --title "$name" \
+                  --notes "$body" \
+                  $prerelease_flag \
+                  --target "$target_commitish" \
+                  --repo "$GITHUB_USER/$REPO_NAME" \
+                  "$RELEASE_TEMP_DIR"/* >> "$LOG_FILE" 2>&1; then
+                  release_created=true
+                  break
+                fi
+              else
+                if gh release create "$tag_name" \
+                  --title "$name" \
+                  --notes "$body" \
+                  $prerelease_flag \
+                  --target "$target_commitish" \
+                  --repo "$GITHUB_USER/$REPO_NAME" >> "$LOG_FILE" 2>&1; then
+                  release_created=true
+                  break
+                fi
+              fi
+              
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - 创建Release失败，重试 $j/$retries..." >> "$LOG_FILE"
+              sleep 10
+            done
+            
+            if [ "$release_created" = true ]; then
+              release_count=$((release_count + 1))
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - Release $tag_name 创建成功($asset_count 个文件)" >> "$LOG_FILE"
+              
+              # 更新最后同步状态
+              write_state "$tag_name" "$published_at"
+            else
+              failed_count=$((failed_count + 1))
+              echo "$(date '+%Y-%m-%d %H:%M:%S') - 创建Release $tag_name 失败" >> "$LOG_FILE"
+            fi
+            
+            # 立即清理当前Release的临时文件
+            rm -rf "$RELEASE_TEMP_DIR"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - 已清理Release $tag_name 的临时文件" >> "$LOG_FILE"
+            
+            sleep 5
+          done
+          
+          # 清理临时文件
+          rm -f "$TEMP_DIR"/*.json
+          rm -rf "$TEMP_DIR"
+          
+          echo "$(date '+%Y-%m-%d %H:%M:%S') - 同步完成，共处理 $release_count 个Release，跳过 $skipped_count 个，失败 $failed_count 个" >> "$LOG_FILE"
+          EOF
+          
+          chmod +x time_filtered_sync.sh
+
+      # 1️⃣3️⃣ 运行时间过滤同步脚本
+      - name: Run time-filtered sync script
+        env:
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
+          RELEASE_AGE_DAYS: ${{ github.event.inputs.release_age_days || 3 }}
+        run: ./time_filtered_sync.sh
+
+      # 1️⃣4️⃣ 上传日志
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-logs
+          path: |
+            sync.log
+            ${{ github.workspace }}/sync.log
+
+      # 1️⃣5️⃣ 最终磁盘空间检查
+      - name: Check final disk space
+        run: |
+          echo "最终磁盘空间使用情况:"
+          df -h
+          echo "工作目录大小:"
+          du -sh . || true
+
+      # 1️⃣6️⃣ 发送完成通知
+      - name: Notify on completion
+        run: |
+          echo "Sync completed at $(date)"
+          echo "Repository: https://github.com/${{ github.repository }}"
+          echo "Time filter: ${{ github.event.inputs.release_age_days || 3 }} days"
