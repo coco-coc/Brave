@@ -8,7 +8,7 @@ on:
       release_age_days:
         description: '只同步最近多少天内的Release (默认3天)'
         required: false
-        default: '3'
+        default: '10'
 
 permissions:
   contents: write
@@ -208,7 +208,7 @@ jobs:
           export DEFAULT_BRANCH="${{ env.DEFAULT_BRANCH }}"
           
           # 设置时间范围参数（默认3天）
-          RELEASE_AGE_DAYS=${RELEASE_AGE_DAYS:-3}
+          RELEASE_AGE_DAYS=${RELEASE_AGE_DAYS:-10}
           echo "$(date '+%Y-%m-%d %H:%M:%S') - 只同步最近 $RELEASE_AGE_DAYS 天内的Release" >> "$LOG_FILE"
           
           # 计算截止日期（修复时间计算问题）
@@ -703,7 +703,7 @@ jobs:
       - name: Run time-filtered sync script
         env:
           SYNC_PAT: ${{ secrets.SYNC_PAT }}
-          RELEASE_AGE_DAYS: ${{ github.event.inputs.release_age_days || 3 }}
+          RELEASE_AGE_DAYS: ${{ github.event.inputs.release_age_days || 10 }}
         run: ./time_filtered_sync.sh
 
       # 1️⃣4️⃣ 上传日志
@@ -729,4 +729,4 @@ jobs:
         run: |
           echo "Sync completed at $(date)"
           echo "Repository: https://github.com/${{ github.repository }}"
-          echo "Time filter: ${{ github.event.inputs.release_age_days || 3 }} days"
+          echo "Time filter: ${{ github.event.inputs.release_age_days || 10 }} days"
