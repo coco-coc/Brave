@@ -9,7 +9,7 @@
  
 ### Leo
 
- - Added "Brave Ocelot" summarization model. ([#52788](https://github.com/brave/brave-browser/issues/53788))
+ - Added "Brave Ocelot" summarization model. ([#52788](https://github.com/brave/brave-browser/issues/52788))
  - Improved Leo performance and responsiveness during periods of high CPU usage. ([#52934](https://github.com/brave/brave-browser/issues/52934))
  - Updated default model list for Brave Leo. ([#52904](https://github.com/brave/brave-browser/issues/52904))
  - Fixed a crash when pasting images into the input field in Leo WebUI. ([#54899](https://github.com/brave/brave-browser/issues/54899))
