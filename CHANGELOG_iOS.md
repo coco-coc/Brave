@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.89.144](https://github.com/brave/brave-browser/releases/tag/v1.89.144)
+
+### Web3
+
+ - Added Cardano support. ([#52339](https://github.com/brave/brave-browser/issues/52339))
+ - Added "Unshield funds" button on the token menu. ([#53718](https://github.com/brave/brave-browser/issues/53718))
+ 
+### Leo
+
+ - Added "Brave Ocelot" summarization model. ([#52788](https://github.com/brave/brave-browser/issues/52788))
+ - Improved Leo performance and responsiveness during periods of high CPU usage. ([#52934](https://github.com/brave/brave-browser/issues/52934))
+ - Updated default model list for Brave Leo. ([#52904](https://github.com/brave/brave-browser/issues/52904))
+ - Fixed a crash when pasting images into the input field in Leo WebUI. ([#54899](https://github.com/brave/brave-browser/issues/54899))
+
+### General 
+
+ - Added ability to switch user agents via Griffin. ([#52858](https://github.com/brave/brave-browser/issues/52858))
+ - Improved logic when hiding server-side 302 redirects. ([#54479](https://github.com/brave/brave-browser/issues/54479))
+ - [Security] Fixed origin mismatch when opening link preview page as reported on HackerOne by b4dc4t. ([#53203](https://github.com/brave/brave-browser/issues/53203))
+ - Fixed Playlist links opening in normal tabs when "Private Browsing Mode" is enabled. ([#52804](https://github.com/brave/brave-browser/issues/52804))
+ - Fixed white bar being shown at the bottom of the page when scrolling with Top Bar mode enabled. ([#54808](https://github.com/brave/brave-browser/issues/54808))
+ - Fixed "Force Paste" not working when pasting into elements within iframes. ([#53367](https://github.com/brave/brave-browser/issues/53367))
+ - Upgraded Chromium to 147.0.7727.117. ([#54850](https://github.com/brave/brave-browser/issues/54850))([Changelog for 147.0.7727.117](https://chromium.googlesource.com/chromium/src/+log/146.0.7680.164..147.0.7727.117?pretty=fuller&n=10000))
+
 ## [1.88.137](https://github.com/brave/brave-browser/releases/tag/v1.88.137)
 
  - Added WebUI support for Brave Leo. ([#49449](https://github.com/brave/brave-browser/issues/49449))
